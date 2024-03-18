@@ -4,14 +4,15 @@ import java.util.List;
 import java.util.function.Supplier;
 
 import com.revrobotics.AbsoluteEncoder;
-import com.revrobotics.CANSparkMax;
-import com.revrobotics.RelativeEncoder;
 import com.revrobotics.CANSparkBase.ControlType;
 import com.revrobotics.CANSparkBase.IdleMode;
 import com.revrobotics.CANSparkLowLevel.MotorType;
+import com.revrobotics.CANSparkMax;
+import com.revrobotics.RelativeEncoder;
 import com.revrobotics.SparkAbsoluteEncoder.Type;
 
 import edu.wpi.first.math.MathUtil;
+import edu.wpi.first.math.controller.PIDController;
 import edu.wpi.first.math.estimator.SwerveDrivePoseEstimator;
 import edu.wpi.first.math.geometry.Pose2d;
 import edu.wpi.first.math.geometry.Rotation2d;
@@ -20,10 +21,9 @@ import edu.wpi.first.math.kinematics.ChassisSpeeds;
 import edu.wpi.first.math.kinematics.SwerveDriveKinematics;
 import edu.wpi.first.math.kinematics.SwerveModulePosition;
 import edu.wpi.first.math.kinematics.SwerveModuleState;
-import edu.wpi.first.math.kinematics.struct.ChassisSpeedsStruct;
 import edu.wpi.first.math.util.Units;
-import edu.wpi.first.units.Measure;
 import edu.wpi.first.wpilibj.ADIS16470_IMU;
+import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.Commands;
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
@@ -58,10 +58,12 @@ public class Swerve extends SubsystemBase {
         // Spec is 15.76 ft/s on a 14t pinion, derated slightly
         public static final double DRIVE_MAX_VELOCITY_METERS_PER_SECOND = Units.feetToMeters(15);
 
-        // TODO: Calculate based on max linear velocity with all wheels oriented tangent to the drive
+        // TODO: Calculate based on max linear velocity with all wheels oriented tangent
+        // to the drive
         public static final double DRIVE_MAX_OMEGA_RADIANS_PER_SECOND = Math.PI;
 
-        public static final ChassisSpeeds MAX_CHASSIS_SPEEDS = new ChassisSpeeds(DRIVE_MAX_VELOCITY_METERS_PER_SECOND, DRIVE_MAX_VELOCITY_METERS_PER_SECOND, DRIVE_MAX_OMEGA_RADIANS_PER_SECOND);
+        public static final ChassisSpeeds MAX_CHASSIS_SPEEDS = new ChassisSpeeds(DRIVE_MAX_VELOCITY_METERS_PER_SECOND,
+                DRIVE_MAX_VELOCITY_METERS_PER_SECOND, DRIVE_MAX_OMEGA_RADIANS_PER_SECOND);
 
         // Just a guess since I can't find supporting documentation - we should only
         // ever be commanding 90 degree rotation and we should be able to do that in
@@ -106,6 +108,14 @@ public class Swerve extends SubsystemBase {
 
         public Rotation2d getRotation2d() {
             return Rotation2d.fromDegrees(thisSubsystem.gyro.getAngle());
+        }
+
+        public Rotation2d getDesiredHeading() {
+            return thisSubsystem.desiredHeading;
+        }
+
+        public void setDesiredHeading(Rotation2d rot) {
+            thisSubsystem.desiredHeading = rot;
         }
 
         public Pose2d getPose() {
@@ -196,51 +206,42 @@ public class Swerve extends SubsystemBase {
             Util.handleREVLibErr(steer.setSmartCurrentLimit(20));
 
             // The duty cycle encoder's native units are [0, 1) rotations
-            // We want to scale to radians, then apply the known radian offset,
-            // then seed the relative encoder.
             var heading_encoder = steer.getAbsoluteEncoder(Type.kDutyCycle);
-            // Rotations -> radians, RPM -> radians per second
-            Util.handleREVLibErr(heading_encoder.setPositionConversionFactor(2 * Math.PI));
+            // Rotations -> rotations, RPM -> rotations per second
             Util.handleREVLibErr(
                     heading_encoder.setVelocityConversionFactor(heading_encoder.getPositionConversionFactor() / 60));
             Util.handleREVLibErr(heading_encoder.setInverted(headingEncoderInverted));
 
             // Each module has its own zero offset:
-            // if we're passed a zero offset of -pi/2, wrap that to 3pi/2.
-            // if passed an offset of 5pi/2, wrap to pi/2
-            var wrappedZeroOffset = MathUtil.angleModulus(zeroOffset.getRadians());
+            // if we're passed a zero offset of -0.25, wrap to 0.75.
+            // if passed an offset of 1.25, wrap to .25
+            var wrappedZeroOffset = MathUtil.inputModulus(zeroOffset.getRotations(), 0, 1);
             Util.handleREVLibErr(heading_encoder.setZeroOffset(wrappedZeroOffset));
-
-            // The duty cycle encoder now reports the heading of the module in
-            // range [0, 2pi)
-            // angleModulus allows us to convert that to [-pi, pi), with 0 still
-            // as "north"
-            var true_heading = MathUtil.angleModulus(heading_encoder.getPosition());
 
             // KISS - use the absolute encoder for feedback to mitigate backlash concerns.
             // just setting up the relative encoder with the right settings so we can use it
             // if needed
             var motor_encoder = steer.getEncoder();
             Util.handleREVLibErr(motor_encoder.setInverted(relativeEncoderInverted));
-            // Rotations -> radians, RPM -> radians per second
+            // Rotations -> rotations, RPM -> rotations per second
             Util.handleREVLibErr(
-                    motor_encoder.setPositionConversionFactor(2 * Math.PI / Constants.STEERING_MOTOR_REDUCTION));
+                    motor_encoder.setPositionConversionFactor(1.0 / Constants.STEERING_MOTOR_REDUCTION));
             Util.handleREVLibErr(
                     motor_encoder.setVelocityConversionFactor(motor_encoder.getPositionConversionFactor() / 60));
 
             // Seed the relative encoder with the true heading
-            Util.handleREVLibErr(motor_encoder.setPosition(true_heading));
+            Util.handleREVLibErr(motor_encoder.setPosition(heading_encoder.getPosition()));
 
             // Configire PID
             var controller = steer.getPIDController();
             Util.handleREVLibErr(controller.setFeedbackDevice(heading_encoder));
             Util.handleREVLibErr(controller.setPositionPIDWrappingEnabled(true));
-            Util.handleREVLibErr(controller.setPositionPIDWrappingMinInput(-Math.PI));
-            Util.handleREVLibErr(controller.setPositionPIDWrappingMaxInput(Math.PI));
+            Util.handleREVLibErr(controller.setPositionPIDWrappingMinInput(0));
+            Util.handleREVLibErr(controller.setPositionPIDWrappingMaxInput(1));
 
-            // In units of output fraction [-1, 1] per radian of error
+            // In units of output fraction [-1, 1] per rotation of error
             Util.handleREVLibErr(controller.setP(3));
-            // In units of output fraction [-1, 1] per radian of error per millisecond
+            // In units of output fraction [-1, 1] per rotation of error per millisecond
             Util.handleREVLibErr(controller.setD(.001));
 
             // Enable the controller
@@ -267,19 +268,6 @@ public class Swerve extends SubsystemBase {
             this.desired = desired;
         }
 
-        /**
-         * Like setDesiredState but doesn't rotate if the desired velocity is 0
-         * // TODO: in theory SwerveModuleKinematics does this for us
-         *
-         * @param desired
-         */
-        public void setDesiredStatePersistAngle(SwerveModuleState desired) {
-            if (desired.speedMetersPerSecond == 0) {
-                desired.angle = getRotation2d();
-            }
-            setDesiredState(desired);
-        }
-
         public SwerveModuleState getDesiredState() {
             return this.desired;
         }
@@ -295,10 +283,9 @@ public class Swerve extends SubsystemBase {
             // should take us to do this rotation and moving one timestep along
             // that line. When DT > timeToComplete, we'll go all the way to the end
             // e.x. rotation change of pi/2 can happen in 200ms
-            var timeToCompleteSeconds = rotationDelta.getRadians() / Constants.MODULE_MAX_SLEW_PER_SECOND;
+            var timeToCompleteSeconds = Math.abs(rotationDelta.getRadians()) / Constants.MODULE_MAX_SLEW_PER_SECOND;
             var limitedSlewRotation = currentRotation.interpolate(
                     optimized.angle,
-                    // TODO - it might be wise to not assume a constant timestep
                     MathUtil.clamp(Constants.SERVICE_DT / timeToCompleteSeconds, 0, 1));
 
             Util.handleREVLibErr(
@@ -312,15 +299,39 @@ public class Swerve extends SubsystemBase {
     private final ADIS16470_IMU gyro;
     private final SwerveDrivePoseEstimator poseEstimator;
 
+    private Rotation2d desiredHeading;
+    private PIDController headingController;
+
     public Swerve() {
         this.state = new State(this);
         this.commands = new CommandFactories(this);
 
+        /*
+         * The zeroing jig provided with MaxSwerve orients each module to:
+         *
+         * |------------|
+         * |----....^...|
+         * .....\...|...|
+         * ......\..|...|
+         * .......\.....|
+         * ........\----|
+         *
+         * Where the arrow indicates the wheel direction.
+         * When applied to all 4 modules though, this gives:
+         * - Module 1 (FL) facing west
+         * - Module 2 (FR) facing north
+         * - Module 3 (RL) facing south
+         * - Module 4 (RR) facing east
+         *
+         * Our constants for each module are captured from the use of the jig,
+         * then we apply offsets to get them to face north
+         */
+
         modules = List.of(
-                new Module(11, 12, Rotation2d.fromRotations(0)),
-                new Module(21, 22, Rotation2d.fromRotations(0)),
-                new Module(31, 32, Rotation2d.fromRotations(0)),
-                new Module(41, 42, Rotation2d.fromRotations(0)));
+                new Module(11, 12, Rotation2d.fromRotations(0 + -0.25)),
+                new Module(21, 22, Rotation2d.fromRotations(0 + +0.00)),
+                new Module(31, 32, Rotation2d.fromRotations(0 + +0.50)),
+                new Module(41, 42, Rotation2d.fromRotations(0 + +0.25)));
         gyro = new ADIS16470_IMU();
 
         poseEstimator = new SwerveDrivePoseEstimator(
@@ -329,17 +340,31 @@ public class Swerve extends SubsystemBase {
                 state.getSwerveModulePositionArray(),
                 // TODO: starting pose from choreo/pathplanner
                 new Pose2d());
+
+        desiredHeading = state.getRotation2d();
+        headingController = new PIDController(
+                3, // Radians/s / radian of error
+                0,
+                0);
+        // units of rotation
+        headingController.enableContinuousInput(-Math.PI, Math.PI);
     }
 
     @Override
     public void periodic() {
         modules.forEach(m -> m.service());
-        poseEstimator.update(
+        poseEstimator.updateWithTime(
+                Timer.getFPGATimestamp(),
                 state.getRotation2d(),
                 state.getSwerveModulePositionArray());
     }
 
     private void setDesiredRobotRelativeSpeeds(ChassisSpeeds speeds) {
+        desiredHeading = desiredHeading
+                .plus(Rotation2d.fromRadians(speeds.omegaRadiansPerSecond * Constants.SERVICE_DT));
+        var headingCorrection = headingController.calculate(state.getRotation2d().getRadians(),
+                desiredHeading.getRadians());
+        speeds.omegaRadiansPerSecond += headingCorrection;
         var discreteSpeeds = ChassisSpeeds.discretize(speeds, Constants.SERVICE_DT);
         var states = Constants.kinematics.toSwerveModuleStates(discreteSpeeds);
         setDesiredModuleStates(states);
@@ -351,6 +376,4 @@ public class Swerve extends SubsystemBase {
             modules.get(i).setDesiredState(states[i]);
         }
     }
-
-
 }
