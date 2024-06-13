@@ -47,7 +47,7 @@ public class Swerve extends SubsystemBase {
         // From https://www.revrobotics.com/rev-21-3005/
         // Reductions are always measured as turns-in/turns-out
         public static final double STEERING_MOTOR_REDUCTION = 9424.0 / 203.0;
-        public static final double DRIVE_MOTOR_PINION_TEETH = 14;
+        public static final double DRIVE_MOTOR_PINION_TEETH = 12;
         // Spot check - with a 12 tooth pinion this is ~5.5:1, as stated by the docs
         public static final double DRIVE_MOTOR_REDUCTION = (22.0 / DRIVE_MOTOR_PINION_TEETH) * (45.0 / 15.0);
         public static final double DRIVE_WHEEL_DIAMETER_INCHES = 3;
@@ -346,15 +346,14 @@ public class Swerve extends SubsystemBase {
                 3, // Radians/s / radian of error
                 0,
                 0);
-        // units of rotation
+        // units of radians
         headingController.enableContinuousInput(-Math.PI, Math.PI);
     }
 
     @Override
     public void periodic() {
         modules.forEach(m -> m.service());
-        poseEstimator.updateWithTime(
-                Timer.getFPGATimestamp(),
+        poseEstimator.update(
                 state.getRotation2d(),
                 state.getSwerveModulePositionArray());
     }
